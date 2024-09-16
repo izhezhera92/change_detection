@@ -15,7 +15,7 @@ from pandas import cut
 from tqdm import tqdm
 from affine import Affine
 import matplotlib.pyplot as plt
-
+import statistics 
 
 
 
@@ -36,7 +36,10 @@ import calculate_utils as cu
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-i1', '--image1', default="./src/odm_orthophoto_small.tif", required=False, help="")
+
+# correct ortho. 
+parser.add_argument('-i1', '--image1', default="./src/odm_orthophoto_small_new_2.tif", required=False, help="")  
+# new ortho
 parser.add_argument('-i2', '--image2', default="./src/odm_orthophoto_big.tif", required=False, help="")
 parsed = parser.parse_args()
 
@@ -49,13 +52,15 @@ class ortho_transformation(object):
     def __init__(self, auto_clean = False):
 
         self.device_type  = 'cpu' # 'mps'
+        # nedded only for triangulation. delete old files
         if auto_clean:
             self.__clean_old_files()
-
+        # coordinate system i trasformation
         self.src_crs = {'init': 'epsg:32636'}
-
+        # torch setup
         torch.set_grad_enabled(False)
         self.device = torch.device("cuda" if torch.cuda.is_available() else self.device_type)
+        # maximum possible value of detected pairs
         self.max_num_keypoints = 2048
         self.verbose = True
 
@@ -73,6 +78,8 @@ class ortho_transformation(object):
                     logging.info(f"{path} has shape: {band1.shape}")
                 height = band1.shape[0]
                 width = band1.shape[1]
+
+                # return a tuple of coordinate matrices from coordinate vectors
                 cols, rows = np.meshgrid(np.arange(width), np.arange(height))
                 xs, ys = rasterio.transform.xy(src.transform, rows, cols)
                 lons = np.array(xs)
@@ -82,7 +89,7 @@ class ortho_transformation(object):
 
 
     def __clean_old_files(self, path: str = './pairs/*')-> int:
-        ''' Method for cleaning old files '''
+        ''' Method for cleaning old files of previous triangulation'''
         files = glob.glob(path)
         for f in files:
             os.remove(f)
@@ -92,6 +99,7 @@ class ortho_transformation(object):
         return 0
 
     def __write_geotif_image(self, path: str = None, data = None, meta = None)-> int:
+        ''' Method for saving geotif file '''
         with rasterio.open(path, 'w', **meta) as dst:
             dst.write(data)
             if self.verbose:
@@ -110,11 +118,15 @@ class ortho_transformation(object):
     def matchec_detection(self, image0, image1)-> tuple:
         ''' Method for the matches finding with LightGlue algorithm'''
 
+        # setup SUperGlue detector
         extractor = SuperPoint(max_num_keypoints=self.max_num_keypoints).eval().to(self.device)  
         matcher = LightGlue(features="superpoint").eval().to(self.device)
 
+        # finding points in both images
         feats0 = extractor.extract(image0.to(self.device))
         feats1 = extractor.extract(image1.to(self.device))
+
+        # matching pairs
         matches01 = matcher({"image0": feats0, "image1": feats1})
         feats0, feats1, matches01 = [
             rbd(x) for x in [feats0, feats1, matches01]
@@ -127,7 +139,7 @@ class ortho_transformation(object):
         return m_kpts0, m_kpts1, matches01, kpts0, kpts1
 
     def affine_transformation_simple(self, img_for_tranformation = None, img_full = None, pts1 = None, pts2 = None, edge = 20):
-        
+        ''' Method for simple affine transformation for triangulation '''
         rows, cols, ch = img_full.shape
         if (rows >= edge and cols >= edge):
             M = cv2.getAffineTransform(pts2, pts1)
@@ -137,7 +149,8 @@ class ortho_transformation(object):
         else:
             return None
 
-    def __image_transformatio(self, src: rasterio.io.DatasetReader = None):
+    def __image_transformation(self, src: rasterio.io.DatasetReader = None):
+        ''' Method for the image transformation '''
         image_data = src.read(
                 out_shape=(
                     src.count,
@@ -149,6 +162,7 @@ class ortho_transformation(object):
         return image_data
 
     def __update_meta(self, src: str = None, transform: Affine = None):
+        ''' Method for the image metadata updating'''
         new_meta = src.meta.copy()
         new_meta.update({
                 'crs': self.src_crs,      
@@ -159,13 +173,22 @@ class ortho_transformation(object):
     def gcp_transformation(self, path: str = None, gcps: list = None, image_gen: bool = True)-> int: # | np.ndarray 
         ''' Method for geotif transformation via GCP's'''
         with rasterio.open(path) as src:
+
+            # setup transformer via gcp's
             transformer = rasterio.transform.GCPTransformer(gcps=gcps) 
             transform = from_gcps(gcps)
-
-            image_data = self.__image_transformatio(src = src)
+            
+            # call transformation method
+            image_data = self.__image_transformation(src = src)
             logging.info(f"Image has been transformated")
+
+            # call metadata data updating method
             new_meta = self.__update_meta(src = src, transform = transform)
+
+            # prepare uniq name
             preffix = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") 
+
+            # save new geotif file
             if image_gen:
                 res = self.__write_geotif_image(path = str('./res/') + str(preffix) + '.tif', data = image_data, meta = new_meta)
                 if self.verbose:
@@ -184,6 +207,7 @@ class ortho_transformation(object):
         
 
     def get_ploygon_frome_fullframe(self, img: np.ndarray = None, pts: list = None):
+        ''' Method for polygons preparation. Used only with triangulation method '''
         ## (1) Crop the bounding rect
         rect = cv2.boundingRect(pts)
         x,y,w,h = rect
@@ -203,10 +227,15 @@ class ortho_transformation(object):
 
 
     def __vizual(self, image0: np.ndarray, image1: np.ndarray, m_kpts0: list, m_kpts1: list, matches01: list, kpts0: list, kpts1: list):
+        ''' Method for result visualization '''
         axes = viz2d.plot_images([image0, image1])
+
+        # plotting mathed pairs
         viz2d.plot_matches(m_kpts0, m_kpts1, color="lime", lw=0.7)
         viz2d.add_text(0, f'Stop after {matches01["stop"]} layers')
         viz2d.save_plot("./res1.jpg")
+
+        # plotting all detected keypoints.
         kpc0, kpc1 = viz2d.cm_prune(matches01["prune0"]), viz2d.cm_prune(matches01["prune1"])
         viz2d.plot_images([image0, image1])
         viz2d.plot_keypoints([kpts0, kpts1], colors=[kpc0, kpc1], ps=6)
@@ -217,55 +246,80 @@ class ortho_transformation(object):
 
 
     def scenario_process(self):
+        ''' main loop '''
         try:
+            # getting lons and lats from both orthos
             lons_small, lats_small = self.pix2coord(path = image1_path)
             logging.info(f"small ortho had been read")
 
             lons_big, lats_big = self.pix2coord(path = image2_path)
             logging.info(f"big ortho had been read")
 
-
+            # reading images for feature processing 
             image0 = load_image(image2_path)
             image1 = load_image(image1_path)
 
             (m_kpts0, m_kpts1, matches01, kpts0, kpts1) = self.matchec_detection(image0 = image0, image1 = image1)
 
-            self.__vizual(image0, image1, m_kpts0, m_kpts1, matches01, kpts0, kpts1)
+            #self.__vizual(image0, image1, m_kpts0, m_kpts1, matches01, kpts0, kpts1)
             
             wear_angles = []
             distances = []
             gcps = []
 
 
+            logging.info(f"Calculate transformation")
             for i in tqdm(range(len(m_kpts0))):
+
+                # getting coordiates in WGS84 CS from each pair from both orthos
                 lat_big = round(lats_big[m_kpts0[i][1].numpy().astype(int)][m_kpts0[i][0].numpy().astype(int)] / 100000 ,6)
                 lon_big = round(lons_big[m_kpts0[i][1].numpy().astype(int)][m_kpts0[i][0].numpy().astype(int)] / 10000 ,6)
                 lat_small = round(lats_small[m_kpts1[i][1].numpy().astype(int)][m_kpts1[i][0].numpy().astype(int)] / 100000,6)
                 lon_small = round(lons_small[m_kpts1[i][1].numpy().astype(int)][m_kpts1[i][0].numpy().astype(int)] / 10000,6)
 
+                # repair problems coordinates (some points have straing latitude values) 
                 if lat_big < 10:
                     lat_big = lat_big + 50.0
 
+                # wear angle ana distance calculation
                 wear_angle = cu.Geodesy().calculate_wear_angle(lat1 = lat_big, lon1 = lon_big, lat2 = lat_small, lon2 = lon_small)
                 distance = cu.Geodesy().calculate_distance_wgs84(lat1 = lat_big, lon1 = lon_big, lat2 = lat_small, lon2 = lon_small)
                 
+                # accumulation wear angel and distance values
                 wear_angles.append(wear_angle)
                 distances.append(distance)
                 
+                # accumulate gcp's points for transformation
                 p1 = m_kpts1[i][1].numpy().astype(int)
                 p2 = m_kpts1[i][0].numpy().astype(int)
                 p3 = lons_big[m_kpts0[i][1].numpy().astype(int)][m_kpts0[i][0].numpy().astype(int)]
                 p4 = lats_big[m_kpts0[i][1].numpy().astype(int)][m_kpts0[i][0].numpy().astype(int)]
                 gcps.append(GroundControlPoint(p1, p2, p3, p4))
 
+            # call gcp's transformation method
+            self.gcp_transformation(gcps = gcps, path = image1_path)            
 
-            self.gcp_transformation(gcps = gcps, path = image1_path)
+            
+            wear_ang_mean = sum(wear_angles) / len(wear_angles)
+            dist_mean = sum(distances) / len(distances)
+            
+            if self.verbose:
+                logging.info(f"wear_angles mean: {wear_ang_mean} ")
+                logging.info(f"distances mean: {dist_mean} ")            
+            
 
             wears_np = np.array(wear_angles) 
             distances_np = np.array(distances) 
-            _, bins = cut(wears_np, bins=250, retbins=True)
-            _, bins = cut(distances_np, bins=250, retbins=True)
-            plt.hist(wears_np, bins)
+
+            if self.verbose:
+                logging.info(f"std wear angle: {np.std(wears_np)} ")
+                logging.info(f"std dist: {np.std(distances_np)} ")
+
+
+            # plotting image 
+            _, bins = cut(distances, bins=250, retbins=True)
+            #_, bins = cut(distances_np, bins=250, retbins=True)
+            plt.hist(distances, bins)
 
             
             '''
